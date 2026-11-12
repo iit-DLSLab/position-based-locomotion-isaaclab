@@ -328,7 +328,7 @@ class ControllerROS2(Node):
         # Safety check to not do anything until a first base and blind state are received
         if(self.first_message_base_arrived==False or self.first_message_joints_arrived==False):
             return
-        if(config.training_env["use_imu"] or config.training_env["use_concurrent_state_est"]):
+        if(config.training_env["base_state_source"] != "ground_truth"):
             if(self.first_message_imu_arrived==False):
                 return
         if self.locomotion_policy.use_vision:

@@ -191,17 +191,14 @@ class Go2FlatEnvCfg(DirectRLEnvCfg):
         history_length = 1
 
 
-    use_imu = False
-
-    
-    use_concurrent_state_est = False
-    if(use_concurrent_state_est):
+    base_state_source = "ground_truth"  # "ground_truth" | "imu" | "concurrent_se"
+    if(base_state_source == "concurrent_se"):
         concurrent_state_est_network_type = "tcn" # "mlp" or "tcn"
         
         concurrent_state_est_output_space = 3 #lin_vel_b
         
-        single_concurrent_state_est_observation_space = 3 # base linear velocity
-        single_concurrent_state_est_observation_space += 3 # base angular velocity  
+        #single_concurrent_state_est_observation_space = 3 # base linear acceleration
+        single_concurrent_state_est_observation_space = 3 # base angular velocity  
         single_concurrent_state_est_observation_space += 3 # projected gravity in base frame
         single_concurrent_state_est_observation_space += 4 # position/heading goal command
         single_concurrent_state_est_observation_space += 12 # joint positions
@@ -236,8 +233,8 @@ class Go2FlatEnvCfg(DirectRLEnvCfg):
         rma_output_space = rma_latent_space if rma_use_latent_space else rma_privileged_observation_space
         observation_space += rma_output_space
 
-        single_rma_observation_space = 3 # base linear velocity
-        single_rma_observation_space += 3 # base angular velocity  
+        #single_rma_observation_space = 3 # base linear acceleration
+        single_rma_observation_space = 3 # base angular velocity  
         single_rma_observation_space += 3 # projected gravity in base frame
         single_rma_observation_space += 4 # position/heading goal command
         single_rma_observation_space += 12 # joint positions

@@ -31,7 +31,6 @@ gymnasium = "*"
 [feature.common.pypi-dependencies]
 readchar = "*"
 onnxruntime = "*"
-torch = "*"  # concurrent state estimator of the policy (deploy/locomotion_policy_wrapper.py)
 mujoco = "*"
 scipy = "*"
 

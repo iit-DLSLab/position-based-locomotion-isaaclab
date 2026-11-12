@@ -102,7 +102,7 @@ class PlayMujoco:
                 base_quat_wxyz = policy_data.qpos[3:7]
                 policy_base_pos = base_pos
 
-                if(config.training_env["use_imu"] or config.training_env["use_concurrent_state_est"]):
+                if(config.training_env["base_state_source"] != "ground_truth"):
                     imu_linear_acceleration = self.mjData.sensordata[0:3]
                     imu_angular_velocity = self.mjData.sensordata[3:6]
                     imu_orientation = self.mjData.sensordata[9:13]

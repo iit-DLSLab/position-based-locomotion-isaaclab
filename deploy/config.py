@@ -26,5 +26,15 @@ with (locomotion_policy_folder / "params" / "env.yaml").open("r", encoding="utf-
 if "perceptive_height_scanner" not in training_env and "height_scanner2" in training_env:
     training_env["perceptive_height_scanner"] = training_env["height_scanner2"]
 
+# Keep the checked-in policies, serialized before base_state_source replaced use_imu and use_concurrent_state_est,
+# deployable.
+if "base_state_source" not in training_env:
+    if training_env.get("use_concurrent_state_est", False):
+        training_env["base_state_source"] = "concurrent_se"
+    elif training_env.get("use_imu", False):
+        training_env["base_state_source"] = "imu"
+    else:
+        training_env["base_state_source"] = "ground_truth"
+
 concurrent_state_est_network = str(locomotion_policy_folder / "exported" / "concurrent_state_estimator.pth")
 rma_network = str(locomotion_policy_folder / "exported" / "rma.pth")

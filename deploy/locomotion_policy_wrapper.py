@@ -11,16 +11,31 @@ np.set_printoptions(precision=3, suppress=True)
 from tqdm import tqdm
 import mujoco
 import onnxruntime as ort
-import torch
 
 from deploy import config
 
 import sys
-import os 
+import os
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(dir_path+"/../")
-sys.path.append(dir_path+"/../source/position_based_locomotion_isaaclab/position_based_locomotion_isaaclab/tasks/")
-from supervised_learning_networks import load_network
+
+
+def load_supervised_network(checkpoint_path):
+    """Load a supervised network (concurrent state estimator, RMA) as a function obs -> prediction.
+
+    Uses the ONNX export saved next to the checkpoint (same name, .onnx) with onnxruntime.
+    """
+    onnx_path = os.path.splitext(checkpoint_path)[0] + ".onnx"
+    options = ort.SessionOptions()
+    # Small network called once per step: one thread, no worker threads spinning between the calls
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    session = ort.InferenceSession(onnx_path, sess_options=options, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    print(f"Network loaded from {onnx_path}")
+    return lambda obs: session.run(None, {input_name: np.asarray(obs, dtype=np.float32).reshape(1, -1)})[0].squeeze()
+
 
 class LocomotionPolicyWrapper:
     def __init__(self, mjModel):
@@ -75,10 +90,11 @@ class LocomotionPolicyWrapper:
         self.use_vision = config.training_env.get("perceptive_height_scanner") is not None
 
         # Learned State Estimator
-        if(config.training_env["use_concurrent_state_est"] == True):
-            self._concurrent_state_est_network = load_network(config.concurrent_state_est_network, device='cpu')
+        if(config.training_env["base_state_source"] == "concurrent_se"):
+            self._concurrent_state_est_network = load_supervised_network(config.concurrent_state_est_network)
             single_concurrent_state_est_observation_space = int(config.training_env["single_concurrent_state_est_observation_space"])
-            self._observation_history_concurrent_state_est = np.zeros((self.history_length, single_concurrent_state_est_observation_space), dtype=np.float32)
+            concurrent_state_est_history_length = int(config.training_env.get("concurrent_state_est_history_length", self.history_length))
+            self._observation_history_concurrent_state_est = np.zeros((concurrent_state_est_history_length, single_concurrent_state_est_observation_space), dtype=np.float32)
 
 
         # Desired joint vector
@@ -90,22 +106,15 @@ class LocomotionPolicyWrapper:
 
 
     def _get_projected_gravity(self, quat_wxyz):        
-        # Get the projected gravity in the base frame
-        GRAVITY_VEC_W = torch.tensor((0, 0, -9.81), dtype=torch.double)
-        GRAVITY_VEC_W = GRAVITY_VEC_W / GRAVITY_VEC_W.norm(p=2, dim=-1).clamp(min=1e-9, max=None).unsqueeze(-1)
-        q = torch.tensor(quat_wxyz).view(1, 4)
-        v = GRAVITY_VEC_W.clone().detach().view(1, 3)
-        q_w = q[..., 0]
-        q_vec = q[..., 1:]
-        a = v * (2.0 * q_w**2 - 1.0).unsqueeze(-1)
-        b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
-        # for two-dimensional tensors, bmm is faster than einsum
-        if q_vec.dim() == 2:
-            c = q_vec * torch.bmm(q_vec.view(q.shape[0], 1, 3), v.view(q.shape[0], 3, 1)).squeeze(-1) * 2.0
-        else:
-            c = q_vec * torch.einsum("...i,...i->...", q_vec, v).unsqueeze(-1) * 2.0
-        projected_gravity =  a - b + c
-        return projected_gravity.numpy().flatten()
+        # Get the projected gravity in the base frame: the unit gravity vector rotated by the inverse of quat_wxyz
+        # (same formula as quat_rotate_inverse of Isaac Lab)
+        v = np.array([0.0, 0.0, -1.0])
+        q_w = float(quat_wxyz[0])
+        q_vec = np.asarray(quat_wxyz[1:], dtype=np.float64)
+        a = v * (2.0 * q_w**2 - 1.0)
+        b = np.cross(q_vec, v) * q_w * 2.0
+        c = q_vec * np.dot(q_vec, v) * 2.0
+        return a - b + c
 
 
     def _update_goal_commands(self, base_pos, base_yaw_w, ref_goal_pose_world):
@@ -187,9 +196,13 @@ class LocomotionPolicyWrapper:
 
 
         # Update Observation ----------------------        
-        if(config.training_env["use_imu"] or config.training_env["use_concurrent_state_est"]):
+        if(config.training_env["base_state_source"] != "ground_truth"):
             base_projected_gravity = self._get_projected_gravity(imu_orientation)
-            base_linear = imu_linear_acceleration
+            if(config.training_env["base_state_source"] == "imu"):
+                # In training the IMU linear acceleration is zeroed (see locomotion_env.py), so do the same here
+                base_linear = np.zeros(3)
+            else:
+                base_linear = imu_linear_acceleration
             base_ang_vel = imu_angular_velocity
         else:
             base_projected_gravity = self._get_projected_gravity(base_quat_wxyz)
@@ -232,9 +245,9 @@ class LocomotionPolicyWrapper:
                 clock_data = -np.ones(8, dtype=np.float32)
 
 
-        if(config.training_env["use_concurrent_state_est"] == True):
+        if(config.training_env["base_state_source"] == "concurrent_se"):
             obs_concurrent_state_est = np.concatenate([
-                base_linear, 
+                #base_linear, # the concurrent SE does not use the IMU linear acceleration
                 base_ang_vel, 
                 base_projected_gravity,
                 commands,
@@ -263,13 +276,13 @@ class LocomotionPolicyWrapper:
             obs_concurrent_state_est = self._observation_history_concurrent_state_est.flatten()
             
             # QUERY THE NETOWRK
-            base_linear = self._concurrent_state_est_network(torch.tensor(obs_concurrent_state_est, dtype=torch.float32).unsqueeze(0)).detach().numpy().squeeze()
+            base_linear = self._concurrent_state_est_network(obs_concurrent_state_est)
             #base_linear = base_lin_vel
         
         
         obs = np.concatenate([
-            base_linear, # this could be imu linear acc if use_imu or linear vel from state est
-            base_ang_vel, # this could be imu angular vel if use_imu or angular vel from state est
+            base_linear, # this could be imu linear acc if base_state_source is "imu" or linear vel from state est
+            base_ang_vel, # this could be imu angular vel if base_state_source is "imu" or angular vel from state est
             base_projected_gravity,
             commands,
             [joints_pos_delta_FL[0]], [joints_pos_delta_FR[0]], [joints_pos_delta_RL[0]], [joints_pos_delta_RR[0]],

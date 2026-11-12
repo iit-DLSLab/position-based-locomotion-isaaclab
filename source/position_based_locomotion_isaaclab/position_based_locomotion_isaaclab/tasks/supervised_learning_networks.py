@@ -49,15 +49,19 @@ class SupervisedNetworkBase(torch.nn.Module):
         self.output_features = out_features
         self.dataset = CustomDataset(max_size=dataset_max_size)
 
-    def train_network(self, batch_size=256, epochs=1000, learning_rate=1e-3, device='cpu', validation_split=0.2):
-        """Train the network with validation loss tracking.
-        
+    def train_network(self, batch_size=256, epochs=1000, learning_rate=1e-3, device='cpu', validation_split=0.2,
+                      validation_interval=50, early_stopping_patience=5, early_stopping_min_delta=0.0):
+        """Train the network with validation loss tracking and early stopping.
+
         Args:
             batch_size: Batch size for training
             epochs: Number of training epochs
             learning_rate: Learning rate for optimizer
             device: Device to train on ('cpu' or 'cuda')
             validation_split: Fraction of data to use for validation (0.0 to 1.0)
+            validation_interval: Number of epochs between two validations
+            early_stopping_patience: Number of validations without improvement before stopping, None to disable
+            early_stopping_min_delta: Minimum decrease of the validation loss to count as an improvement
         """
         # Split dataset into training and validation
         dataset_size = len(self.dataset)
@@ -92,7 +96,10 @@ class SupervisedNetworkBase(torch.nn.Module):
 
         # Training loop
         best_val_loss = float('inf')
-        
+        best_state_dict = None
+        validations_without_improvement = 0
+        use_early_stopping = early_stopping_patience is not None and val_size > 0
+
         for epoch in range(epochs):
             with torch.inference_mode(False):
                 with torch.enable_grad():
@@ -123,7 +130,7 @@ class SupervisedNetworkBase(torch.nn.Module):
             if (epoch + 1) % 10 == 0 or epoch == 0:
                 print(f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_train_loss:.6f}")
 
-            if(epoch % 100 == 0):
+            if(epoch % validation_interval == 0 or epoch == epochs - 1):
                 # Validation phase
                 self.eval()
                 val_loss = 0.0
@@ -141,13 +148,26 @@ class SupervisedNetworkBase(torch.nn.Module):
                 
                 avg_val_loss = val_loss / val_batches if val_batches > 0 else 0.0
                 
-                # Track best validation loss
-                if avg_val_loss < best_val_loss:
+                # Track best validation loss, keeping a copy of the best weights
+                if avg_val_loss < best_val_loss - early_stopping_min_delta:
                     best_val_loss = avg_val_loss
-            
+                    best_state_dict = {k: v.detach().clone() for k, v in self.state_dict().items()}
+                    validations_without_improvement = 0
+                else:
+                    validations_without_improvement += 1
+
                 # Print progress validation loss
                 print(f"Epoch {epoch + 1}/{epochs} - Val Loss: {avg_val_loss:.6f}")
-        
+
+                if use_early_stopping and validations_without_improvement >= early_stopping_patience:
+                    print(f"Early stopping at epoch {epoch + 1}: no improvement in the last "
+                          f"{early_stopping_patience} validations.")
+                    break
+
+        # Go back to the weights with the lowest validation loss
+        if use_early_stopping and best_state_dict is not None:
+            self.load_state_dict(best_state_dict)
+
         self.eval()
         print(f"Training complete. Best validation loss: {best_val_loss:.6f}")
         print("Model set to evaluation mode.")
@@ -172,11 +192,43 @@ class SupervisedNetworkBase(torch.nn.Module):
             'network_type': self.network_type,
             'model_kwargs': self._checkpoint_kwargs(),
         }, filepath)
-        
+
         print(f"Network saved to {filepath}")
-        
+
         # Move model back to original device
         #self.to(original_device)
+
+        # Save also the ONNX export next to the checkpoint, used at deploy time with onnxruntime (no torch needed)
+        try:
+            onnx_path = self.export_onnx(filepath)
+            print(f"Network exported to {onnx_path}")
+        except Exception as error:  # the checkpoint is already saved: do not stop the training for this
+            print(f"Warning: ONNX export of {filepath} failed: {error}")
+
+    def export_onnx(self, filepath):
+        """Export the network to ONNX, next to filepath with the .onnx extension.
+
+        A CPU copy in eval mode is exported, so the network being trained is neither moved nor switched to eval.
+        Same settings as the policy export of isaaclab_rl: opset 18, input "obs" with a batch of 1, but with the
+        weights inside the .onnx file (no separate .onnx.data to copy along).
+        """
+        onnx_path = os.path.splitext(filepath)[0] + ".onnx"
+        export_model = create_supervised_network(
+            self.input_features, self.output_features, network_type=self.network_type, **self._checkpoint_kwargs()
+        )
+        export_model.load_state_dict({name: value.detach().cpu() for name, value in self.state_dict().items()})
+        export_model.eval()
+        torch.onnx.export(
+            export_model,
+            torch.zeros(1, self.input_features),
+            onnx_path,
+            export_params=True,
+            opset_version=18,
+            input_names=["obs"],
+            output_names=["output"],
+            external_data=False,
+        )
+        return onnx_path
 
 
 class MlpNN(SupervisedNetworkBase):
@@ -426,6 +478,19 @@ if __name__ == "__main__":
             assert loaded_predictions.shape == (batch_size, output_features), (
                 f"Loaded {network_type} output shape mismatch: {loaded_predictions.shape}"
             )
+
+            # The ONNX export saved next to the checkpoint must give the same predictions
+            try:
+                import onnxruntime
+            except ImportError:
+                print("onnxruntime not installed, skipping the ONNX check.")
+            else:
+                session = onnxruntime.InferenceSession(os.path.splitext(checkpoint_path)[0] + ".onnx")
+                with torch.no_grad():
+                    for sample in test_inputs:
+                        expected = loaded_model(sample.unsqueeze(0)).numpy()
+                        onnx_prediction = session.run(None, {"obs": sample.unsqueeze(0).numpy()})[0]
+                        assert abs(onnx_prediction - expected).max() < 1e-5, f"{network_type} ONNX mismatch"
 
             print(f"{network_type} smoke test passed.")
 
