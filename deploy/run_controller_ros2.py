@@ -1,0 +1,453 @@
+import os
+
+# Fail-safe: se non è stato scelto esplicitamente altro,
+# ROS 2 comunica solamente sulla macchina locale.
+os.environ.setdefault("ROS_LOCALHOST_ONLY", "1")
+
+print(
+    "ROS 2 network mode:",
+    "LOCALHOST" if os.environ["ROS_LOCALHOST_ONLY"] == "1" else "NETWORK",
+)
+
+import sys
+import shlex
+import subprocess
+from pathlib import Path
+
+dir_path = Path(__file__).resolve().parent
+sys.path.append(str(dir_path / ".."))
+sys.path.append(str(dir_path / "mujoco_utils"))
+
+ros_ws = dir_path / "ros2_ws"
+setup_bash = ros_ws / "install" / "setup.bash"
+
+if not setup_bash.exists():
+    print("Building the msgs first...")
+    subprocess.run(["colcon", "build"], cwd=ros_ws, check=True)
+
+if os.environ.get("POSITION_BASED_LOCOMOTION_ROS2_SOURCED") != "1":
+    print("Sourcing ROS2 workspace and restarting script...")
+    cmd = (
+        f"source {shlex.quote(str(setup_bash))} && "
+        "export POSITION_BASED_LOCOMOTION_ROS2_SOURCED=1 && "
+        f"exec {shlex.quote(sys.executable)} "
+        + " ".join(shlex.quote(arg) for arg in [str(Path(__file__).resolve()), *sys.argv[1:]])
+    )
+    os.execv("/bin/bash", ["bash", "-c", cmd])
+
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Joy
+from visualization_msgs.msg import Marker, MarkerArray
+from dls2_interface.msg import BaseState, BlindState, Imu, TrajectoryGenerator
+
+import time
+import numpy as np
+np.set_printoptions(precision=3, suppress=True)
+
+import threading
+
+import copy
+
+# Simulation related imports
+import mujoco
+import mujoco.viewer
+import mujoco_utils
+from heightmap import HeightMap
+
+
+# Locomotion Policy imports
+from locomotion_policy_wrapper import LocomotionPolicyWrapper
+
+from deploy import config
+
+# Set the priority of the process
+pid = os.getpid()
+print("PID: ", pid)
+os.system("renice -n -21 -p " + str(pid))
+os.system("echo -20 > /proc/" + str(pid) + "/autogroup")
+#for real time, launch it with chrt -r 99 python3 run_controller.py
+
+
+USE_MUJOCO_RENDER = False
+
+
+class ControllerROS2(Node):
+    def __init__(self):
+        super().__init__('ControllerROS2')
+
+        # Mujoco model and data
+        self.mjModel = mujoco.MjModel.from_xml_path(str(dir_path / "../robot_model" / config.robot / f"{config.scene}.xml"))
+        self.mjData = mujoco.MjData(self.mjModel)
+        keyframe_id = mujoco.mj_name2id(self.mjModel, mujoco.mjtObj.mjOBJ_KEY, "down")
+        self.mjData.qpos = self.mjModel.key_qpos[keyframe_id]
+        mujoco.mj_forward(self.mjModel, self.mjData)
+
+        self.last_render_time = time.time()
+        if USE_MUJOCO_RENDER:
+            self.viewer = mujoco.viewer.launch_passive(
+                self.mjModel,
+                self.mjData,
+                show_left_ui=False,
+                show_right_ui=False,
+            )
+            mujoco.mjv_defaultFreeCamera(self.mjModel, self.viewer.cam)
+
+
+        # Subscribers and Publishers
+        self.subscription_base_state = self.create_subscription(BaseState,"/base_state_gt", self.get_base_state_callback, 1)
+        self.subscription_blind_state = self.create_subscription(BlindState,"/blind_state", self.get_blind_state_callback, 1)
+        self.subscription_imu = self.create_subscription(Imu,"imu", self.get_imu_callback, 1)
+
+        self.subscription_joy = self.create_subscription(Joy,"joy", self.get_joy_callback, 1)
+        self.last_joy_time = None
+
+        self.publisher_trajectory_generator = self.create_publisher(TrajectoryGenerator,"/trajectory_generator", 1)
+        self.sequence_id = 0 # To keep track of the last msg sent, useful for debugging and synchronization
+        RL_FREQ = 1./(config.training_env["sim"]["dt"]*config.training_env["decimation"])  # Hz, frequency of the RL controller
+        self.timer = self.create_timer(1.0/RL_FREQ, self.compute_rl_control)
+
+
+        # Safety check to not do anything until a first base and blind state are received
+        self.first_message_base_arrived = False
+        self.first_message_joints_arrived = False
+        self.first_message_imu_arrived = False
+        self.first_message_heightmap_arrived = False
+
+        # Timing stuff
+        self.loop_time = 0.002
+        self.last_start_time = None
+
+        # Base State
+        self.position = np.zeros(3)
+        self.orientation = np.zeros(4)
+        self.linear_velocity = np.zeros(3)
+        self.angular_velocity = np.zeros(3)
+
+        # Blind State
+        self.legs_joints_position = np.zeros(12)
+        self.legs_joints_velocity = np.zeros(12)
+
+        # IMU
+        self.imu_linear_acceleration = np.zeros(3)
+        self.imu_angular_velocity = np.zeros(3)
+        self.imu_orientation = np.zeros(4)
+
+        # Commands
+        self.ref_goal_pose_world = np.zeros(3)
+        self.ref_base_lin_vel_H = np.zeros(3)
+        self.ref_base_ang_yaw_dot = 0.0
+
+
+        # Initialization of variables used in the main control loop --------------------------------
+        self.locomotion_policy = LocomotionPolicyWrapper(mjModel=self.mjModel)
+
+        # On perceptive policies, use the ROS marker scan in place of MuJoCo ray casting.
+        self.heightmap = None
+        self._last_heightmap_warning_time = 0.0
+        if self.locomotion_policy.use_vision:
+            pattern_cfg = config.training_env["perceptive_height_scanner"]["pattern_cfg"]
+            resolution_heightmap = pattern_cfg["resolution"]
+            num_rows_heightmap = round(pattern_cfg["size"][0] / resolution_heightmap) + 1
+            num_cols_heightmap = round(pattern_cfg["size"][1] / resolution_heightmap) + 1
+            self.heightmap = HeightMap(
+                num_rows=num_rows_heightmap,
+                num_cols=num_cols_heightmap,
+                dist_x=resolution_heightmap,
+                dist_y=resolution_heightmap,
+                mj_model=self.mjModel,
+                mj_data=self.mjData,
+            )
+            self.subscription_heightmap = self.create_subscription(MarkerArray, "/height_scan_markers", self.get_heightmap_callback, 1,)
+
+
+        goDown_qpos = self.mjModel.key_qpos[keyframe_id]
+        self.desired_joint_pos_leg = goDown_qpos[7:19].copy()
+        self.legs_joints_position = goDown_qpos[7:19].copy()
+
+
+        # Interactive Command Line ----------------------------
+        from console_controller import Console
+        self.console = Console(controller_node=self)
+        thread_console = threading.Thread(target=self.console.interactive_command_line)
+        thread_console.daemon = True
+        thread_console.start()
+
+
+    def get_joy_callback(self, msg):
+        """
+        Callback function to handle joystick input. Joystick used is a
+        8Bitdi Ultimate 2C Wireless Controller.
+        """
+
+        filter_joystick = 0.7
+        self.ref_base_lin_vel_H[0] = self.ref_base_lin_vel_H[0]*filter_joystick + (msg.axes[1]/3.5)*(1-filter_joystick)  # Forward/Backward
+        self.ref_base_lin_vel_H[1] = self.ref_base_lin_vel_H[1]*filter_joystick + (msg.axes[0]/3.5)*(1-filter_joystick)  # Left/Right
+        self.ref_base_ang_yaw_dot = self.ref_base_ang_yaw_dot*filter_joystick + (msg.axes[3]/2.)*(1-filter_joystick)  # Yaw
+
+        if(self.ref_base_lin_vel_H[0] > 0.1 or self.ref_base_lin_vel_H[1] > 0.1):
+
+            self.locomotion_policy._goal_manual_heading_initialized = False
+            self.locomotion_policy._goal_approaching_initialized = False
+
+            base_pos = self.mjData.qpos[0:3]
+            R_heading = mujoco_utils.heading_orientation_SO3(self.mjData)
+
+            if(self.ref_base_lin_vel_H[0] > 0.1):
+                goal_x_horizontal = 0.3
+            else:
+                goal_x_horizontal = 0.0
+
+
+            #print("self.ref_base_lin_vel_H: ", self.ref_base_lin_vel_H)
+            
+            """if(self.ref_base_lin_vel_H[1] > 0.1):
+                goal_y_horizontal = 0.5
+                self.locomotion_policy._goal_manual_heading_initialized = False
+                self.locomotion_policy._goal_approaching_initialized = False
+            else:"""
+            goal_y_horizontal = 0.0
+
+            offset_world = R_heading @ np.array([goal_x_horizontal,
+                                                goal_y_horizontal,
+                                                0.0])
+
+            goal_pos_world = base_pos + offset_world
+            
+
+            self.ref_goal_pose_world = np.array([goal_pos_world[0],
+                                                            goal_pos_world[1],
+                                                            0.0])
+
+        if(abs(self.ref_base_ang_yaw_dot) > 0.1):
+            
+            if(self.ref_base_ang_yaw_dot > 0.1):
+                goal_yaw_horizontal = 0.5
+            else:
+                goal_yaw_horizontal = -0.5   
+            self.locomotion_policy._goal_approaching_initialized = False
+            self.locomotion_policy._goal_manual_heading_initialized = True
+
+            # Trasform from horizontal frame to world frame
+            base_pos = self.mjData.qpos[0:3]
+            R_heading = mujoco_utils.heading_orientation_SO3(self.mjData)
+
+            offset_world = R_heading @ np.array([0.0,
+                                                0.0,
+                                                0.0])
+
+            goal_pos_world = base_pos + offset_world
+            
+            base_yaw = mujoco_utils.base_ori_euler_xyz(self.mjData)[2]  # oppure equivalente
+            goal_yaw_world = base_yaw + goal_yaw_horizontal
+
+            self.ref_goal_pose_world = np.array([goal_pos_world[0],
+                                                            goal_pos_world[1],
+                                                            goal_yaw_world])
+                    
+
+        self.last_joy_time = time.time()
+
+
+    def get_base_state_callback(self, msg):
+        self.position = np.array(msg.pose.position) #world frame
+        # For the quaternion, the order is [x, y, z, w] on DLS2 but here we want [w, x, y, z] (mujoco convention)
+        self.orientation = np.roll(np.array(msg.pose.orientation), 1) #world frame
+        self.linear_velocity = np.array(msg.velocity.linear) #world frame
+        self.angular_velocity = np.array(msg.velocity.angular) #base frame
+
+        self.first_message_base_arrived = True
+
+
+    def get_blind_state_callback(self, msg):
+        self.legs_joints_position = np.array(msg.joints_position)
+        self.legs_joints_velocity = np.array(msg.joints_velocity)
+
+        self.first_message_joints_arrived = True
+
+
+    def get_imu_callback(self, msg):
+        self.imu_linear_acceleration = np.array(msg.linear_acceleration)
+        self.imu_angular_velocity = np.array(msg.angular_velocity)
+        # For the quaternion, the order is [x, y, z, w] on DLS2 but here we want [w, x, y, z] (mujoco convention)
+        self.imu_orientation = np.roll(np.array(msg.orientation), 1)
+
+        self.first_message_imu_arrived = True
+
+
+    def get_heightmap_callback(self, msg):
+        """Load a complete ``/height_scan_markers`` scan into ``self.heightmap``."""
+        try:
+            markers = sorted(
+                (
+                    marker
+                    for marker in msg.markers
+                    if marker.action == Marker.ADD and marker.type == Marker.SPHERE
+                ),
+                key=lambda marker: marker.id,
+            )
+            sample_count = self.heightmap.num_rows * self.heightmap.num_cols
+            points = np.array(
+                [
+                    [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z]
+                    for marker in markers
+                ],
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(points)):
+                raise ValueError("marker positions must be finite")
+
+            # Publisher order is Y-major/X-minor. HeightMap uses descending X/Y.
+            grid = points.reshape(self.heightmap.num_cols, self.heightmap.num_rows, 3)
+            grid = np.flip(grid.transpose(1, 0, 2), axis=(0, 1))
+            self.heightmap.sensor_data_matrix[:] = grid[:, :, None, :]
+        except ValueError as error:
+            # Keep the last complete scan and throttle malformed-scan warnings.
+            now = time.monotonic()
+            if now - self._last_heightmap_warning_time >= 2.0:
+                self.get_logger().warning(f"Ignoring height-map markers: {error}")
+                self._last_heightmap_warning_time = now
+            return
+
+        if not self.first_message_heightmap_arrived:
+            self.get_logger().info(f"Received the first complete height map ({sample_count} samples)")
+        self.first_message_heightmap_arrived = True
+
+
+    def compute_rl_control(self):
+        # Update the loop time
+        start_time = time.perf_counter()
+        if(self.last_start_time is not None):
+            self.loop_time = (start_time - self.last_start_time)
+        self.last_start_time = start_time
+        simulation_dt = self.loop_time
+
+
+
+        # Safety check to not do anything until a first base and blind state are received
+        if(self.first_message_base_arrived==False or self.first_message_joints_arrived==False):
+            return
+        if(config.training_env["use_imu"] or config.training_env["use_concurrent_state_est"]):
+            if(self.first_message_imu_arrived==False):
+                return
+        if self.locomotion_policy.use_vision:
+            if not self.first_message_heightmap_arrived:
+                return
+
+        # Update the mujoco model
+        self.mjData.qpos[0:3] = copy.deepcopy(self.position)
+        self.mjData.qvel[0:3] = copy.deepcopy(self.linear_velocity)
+
+        self.mjData.qpos[3:7] = copy.deepcopy(self.orientation)
+        self.mjData.qvel[3:6] = copy.deepcopy(self.angular_velocity)
+
+        self.mjData.qpos[7:19] = copy.deepcopy(self.legs_joints_position)
+        self.mjData.qvel[6:18] = copy.deepcopy(self.legs_joints_velocity)
+        self.mjModel.opt.timestep = simulation_dt
+        mujoco.mj_forward(self.mjModel, self.mjData)
+
+        # Safety check for joystick timeout
+        if(self.last_joy_time is not None and time.time() - self.last_joy_time > 1.0):
+            self.ref_goal_pose_world = np.array([self.mjData.qpos[0], self.mjData.qpos[1], mujoco_utils.base_ori_euler_xyz(self.mjData)[2]])
+            print("Joystick timeout, stopping the robot")
+            self.last_joy_time = None
+
+
+        qpos, qvel = self.mjData.qpos, self.mjData.qvel
+        base_lin_vel = mujoco_utils.base_lin_vel(self.mjData, frame='base')
+        base_ang_vel = mujoco_utils.base_ang_vel(self.mjData, frame='base')
+        base_ori_euler_xyz = mujoco_utils.base_ori_euler_xyz(self.mjData)
+        heading_orientation_SO3 = mujoco_utils.heading_orientation_SO3(self.mjData)
+        base_quat_wxyz = qpos[3:7]
+        base_pos = mujoco_utils.base_pos(self.mjData)
+
+        joints_pos_leg = qpos[7:19]
+        joints_vel_leg = qvel[6:18]
+
+        heightmap_data = None
+        if self.locomotion_policy.use_vision:
+            rotation = np.empty(9, dtype=np.float64)
+            mujoco.mju_quat2Mat(rotation, base_quat_wxyz)
+            local_points = self.heightmap.sensor_data_matrix.reshape(-1, 3)
+            self.heightmap.data = (
+                local_points @ rotation.reshape(3, 3).T + base_pos
+            ).reshape(self.heightmap.sensor_data_matrix.shape)
+            heightmap_data = self.heightmap.data
+
+
+        if(self.console.isRLActivated):
+
+            desired_joint_pos = self.locomotion_policy.compute_control(
+                        base_pos=base_pos,
+                        base_ori_euler_xyz=base_ori_euler_xyz,
+                        base_quat_wxyz=base_quat_wxyz,
+                        base_lin_vel=base_lin_vel,
+                        base_ang_vel=base_ang_vel,
+                        heading_orientation_SO3=heading_orientation_SO3,
+                        joints_pos_leg=joints_pos_leg,
+                        joints_vel_leg=joints_vel_leg,
+                        ref_goal_pose_world=self.ref_goal_pose_world,
+                        imu_linear_acceleration=self.imu_linear_acceleration,
+                        imu_angular_velocity=self.imu_angular_velocity,
+                        imu_orientation=self.imu_orientation,
+                        heightmap_data=heightmap_data)
+
+            # Impedence Loop
+            Kp = self.locomotion_policy.Kp_walking
+            Kd = self.locomotion_policy.Kd_walking
+
+        else:
+            desired_joint_pos = self.desired_joint_pos_leg
+
+            # Impedence Loop
+            Kp = self.locomotion_policy.Kp_stand_up_and_down
+            Kd = self.locomotion_policy.Kd_stand_up_and_down
+
+        # Publish the desired joint positions to the trajectory generator --------------------------------
+        trajectory_generator_msg = TrajectoryGenerator()
+        trajectory_generator_msg.timestamp = float(self.get_clock().now().nanoseconds)
+        trajectory_generator_msg.sequence_id = int(self.sequence_id % 1000)  # To avoid overflow, we reset the sequence id after it reaches a certain value
+        self.sequence_id += 1
+        trajectory_generator_msg.joints_position = np.array(desired_joint_pos).flatten().tolist()
+        trajectory_generator_msg.joints_velocity = np.zeros(12).tolist()
+        trajectory_generator_msg.kp = (np.ones(12) * Kp).tolist()
+        trajectory_generator_msg.kd = (np.ones(12) * Kd).tolist()
+
+        self.publisher_trajectory_generator.publish(trajectory_generator_msg)
+
+
+        # Render the simulation at a certain frequency -----------------------------------------------------------
+        if USE_MUJOCO_RENDER:
+            RENDER_FREQ = 30  # Hz
+            if time.time() - self.last_render_time > 1.0 / RENDER_FREQ:
+                self.viewer.cam.lookat[:] = base_pos
+                self.viewer.sync()
+                self.last_render_time = time.time()
+
+                if self.locomotion_policy.use_vision and self.heightmap.data is not None:
+                    for i in range(self.heightmap.data.shape[0]):
+                        for j in range(self.heightmap.data.shape[1]):
+                            self.heightmap.geom_ids[i, j] = mujoco_utils.render_sphere(
+                                viewer=self.viewer,
+                                position=self.heightmap.data[i, j, 0],
+                                diameter=0.02,
+                                color=[0, 1, 0, 0.5],
+                                geom_id=self.heightmap.geom_ids[i, j],
+                            )
+
+
+#---------------------------
+if __name__ == '__main__':
+
+    print('Hello from position-based-locomotion-isaaclab ros node.')
+
+    rclpy.init()
+    controller_ros2_node = ControllerROS2()
+    rclpy.spin(controller_ros2_node)
+
+    controller_ros2_node.destroy_node()
+    rclpy.shutdown()
+
+    print("ControllerROS2 node is stopped")
+    exit(0)

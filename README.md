@@ -1,1 +1,77 @@
-# position-based-locomotion-isaaclab
+<div style="text-align: left;">
+  <img src="https://img.shields.io/badge/IsaacLab%20-v3.0.0-green" alt="IsaacLab v3.0.0" style="margin-bottom: 1px;">
+  <img src="https://img.shields.io/badge/rsl_rl%20-v5.5.1-brown" alt="rsl-rl v5.5.1" style="margin-bottom: 1px;">
+  <img src="https://img.shields.io/badge/Mujoco%20-v3.13.0-blue" alt="Mujoco v3.13.0" style="margin-bottom: 1px;">
+</div>
+
+## Overview
+
+Reinforcement learning implementation of **position-based quadruped locomotion** in IsaacLab: the policy is commanded with a goal position and heading instead of a velocity. It includes scripts for both sim-to-sim and sim-to-real transfer.
+
+Features:
+- Position-based command (goal x/y and heading)
+- [Concurrent State Estimator](https://arxiv.org/pdf/2202.05481)
+- [Morphological Symmetries](https://arxiv.org/pdf/2403.17320)
+- Identification of robot parameters for sim2real using [pace](https://github.com/leggedrobotics/pace-sim2real) via our repo [sim2real-robot-identification](https://github.com/iit-DLSLab/sim2real-robot-identification)
+- Sim-to-Sim in [Mujoco](https://github.com/google-deepmind/mujoco)
+- Sim-to-Real using ROS2
+
+
+Real-world deployment via:
+- [iekf-quadruped-isaaclab](https://github.com/iit-DLSLab/iekf-quadruped-isaaclab) for state estimation (if no concurrent state estimation is used)
+- [unitree-ros2-dls](https://github.com/iit-DLSLab/unitree-ros2-dls) for unitree robot communication
+
+A list of robots and environments available is described below:
+
+| Robot Model         | Environment Name Pattern                                   |
+|---------------------|------------------------------------------------------------|
+| [Go2](./robot_model/go2/) | PositionBased-**RobotModel**-Flat <br> PositionBased-**RobotModel**-Rough-Blind <br> PositionBased-**RobotModel**-Rough-Vision |
+
+
+## Installation and Runs
+
+If you want only to deploy a trained policy on your robot, continue on [README_deploy](./README_deploy.md) otherwise on [README_train](./README_train.md).
+
+**For the train, check first the compatibility with IsaacLab and rsl-rl at the top of this readme. They indicate the releases that we tested.**
+
+
+
+## Citing this work
+
+If you find the work useful and you adopt [Morphological Symmetries](https://arxiv.org/pdf/2403.17320), please consider citing one of our works:
+
+#### [Leveraging Symmetry in RL-based Legged Locomotion Control (IROS-2024)](https://arxiv.org/pdf/2403.17320)
+
+```
+@inproceedings{suhuang2024leveraging,
+  author={Su, Zhi and Huang, Xiaoyu and Ordoñez-Apraez, Daniel and Li, Yunfei and Li, Zhongyu and Liao, Qiayuan and Turrisi, Giulio and Pontil, Massimiliano and Semini, Claudio and Wu, Yi and Sreenath, Koushil},
+  booktitle={2024 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)}, 
+  title={Leveraging Symmetry in RL-based Legged Locomotion Control}, 
+  year={2024},
+  pages={6899-6906},
+  doi={10.1109/IROS58592.2024.10802439}
+}
+```
+
+#### [Morphological symmetries in robotics (IJRR-2025)](https://arxiv.org/pdf/2402.15552):
+
+```
+@article{ordonez2025morphosymm,
+  author = {Daniel Ordoñez-Apraez and Giulio Turrisi and Vladimir Kostic and Mario Martin and Antonio Agudo and Francesc Moreno-Noguer and Massimiliano Pontil and Claudio Semini and Carlos Mastalli},
+  title ={Morphological symmetries in robotics},
+  journal = {The International Journal of Robotics Research},
+  year = {2025},
+  volume = {44},
+  number = {10-11},
+  pages = {1743-1766},
+  doi = {10.1177/02783649241282422},
+}
+```
+
+## How to contribute
+
+PRs are very welcome (search for **TODO** in the issue, or add what you like)!
+
+## Maintainer
+
+This repository is maintained by [Giulio Turrisi](https://github.com/giulioturrisi).
